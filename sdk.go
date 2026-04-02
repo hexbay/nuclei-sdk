@@ -24,9 +24,11 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/output"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolinit"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
 	"github.com/projectdiscovery/nuclei/v3/pkg/templates"
 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
 	errorutil "github.com/projectdiscovery/utils/errors"
+	"github.com/rs/xid"
 )
 
 // NucleiSDK 它封装了 nuclei 引擎的核心功能
@@ -68,13 +70,24 @@ type SDKOptions func(opts *types.Options) error
 // NewSDK 返回一个新的 NucleiSDK 实例
 // 初始化所有必要的组件，包括日志级别、协议、工作池和目录
 func NewSDK(opts *types.Options) (*NucleiSDK, error) {
+	// 初始化 Logger（参考 nuclei 官方 pkg/types/types.go:800）
+	if opts.Logger == nil {
+		opts.Logger = &gologger.Logger{}
+	}
+	
+	// 初始化 ExecutionId（参考 nuclei 官方 pkg/types/types.go:799）
+	// 这对于 protocolstate 的正确初始化至关重要
+	if opts.ExecutionId == "" {
+		opts.ExecutionId = xid.New().String()
+	}
+	
 	// Configure logging based on options
 	if opts.Verbose {
-		gologger.DefaultLogger.SetMaxLevel(levels.LevelVerbose)
+		opts.Logger.SetMaxLevel(levels.LevelVerbose)
 	} else if opts.Debug {
-		gologger.DefaultLogger.SetMaxLevel(levels.LevelDebug)
+		opts.Logger.SetMaxLevel(levels.LevelDebug)
 	} else if opts.Silent {
-		gologger.DefaultLogger.SetMaxLevel(levels.LevelSilent)
+		opts.Logger.SetMaxLevel(levels.LevelSilent)
 	}
 	// fix options
 	if opts.HeadlessTemplateThreads <= 0 {
@@ -87,22 +100,12 @@ func NewSDK(opts *types.Options) (*NucleiSDK, error) {
 		rateLimiter = ratelimit.New(ctx, uint(opts.RateLimit), opts.RateLimitDuration)
 	} else {
 		rateLimiter = ratelimit.NewUnlimited(ctx)
-		// fix 目前nuclei 对NewUnlimited支持还有问题 if eo.RateLimiter.GetLimit() != uint(eo.Options.RateLimit) 没有判断
-		opts.RateLimit = int(rateLimiter.GetLimit())
 	}
 	safeOptions := &SafeOptions{
 		catalog:     disk.NewCatalog(config.DefaultConfig.TemplatesDirectory),
 		parser:      templates.NewParser(),
 		rateLimiter: rateLimiter,
 	}
-	// Initialize protocols
-	sharedInit := &sync.Once{}
-	sharedInit.Do(func() {
-		err := protocolinit.Init(opts)
-		if err != nil {
-			gologger.Error().Msgf("Could not initialize protocols: %s", err)
-		}
-	})
 	// Create SDK instance
 	sdk := &NucleiSDK{
 		ctx:           ctx,
@@ -143,18 +146,27 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 	// cleanup and stop all resources
 	defer unsafeOpts.Close()
 
+	// 初始化协议状态（参考 nuclei 官方 lib/sdk_private.go:128-130）
+	if protocolstate.ShouldInit(baseOpts.ExecutionId) {
+		if err := protocolinit.Init(&baseOpts); err != nil {
+			return errorutil.New("Could not initialize protocols: %s\n", err)
+		}
+	}
+
 	// load templates
 	workflowLoader, err := workflow.NewLoader(&unsafeOpts.executeOpts)
 	if err != nil {
 		return errorutil.New("Could not create workflow loader: %s\n", err)
 	}
 	unsafeOpts.executeOpts.WorkflowLoader = workflowLoader
-	store, err := loader.New(loader.NewConfig(&baseOpts, n.safeOptions.catalog, unsafeOpts.executeOpts))
+	store, err := loader.New(loader.NewConfig(&baseOpts, n.safeOptions.catalog, &unsafeOpts.executeOpts))
 	if err != nil {
 		return errorutil.New("Could not create loader client: %s\n", err)
 	}
-	store.Load()
-	inputProvider := provider.NewSimpleInputProviderWithUrls(targets...)
+	if err := store.Load(); err != nil {
+		return errorutil.New("Could not load templates: %s\n", err)
+	}
+	inputProvider := provider.NewSimpleInputProviderWithUrls("", targets...)
 	if len(store.Templates()) == 0 && len(store.Workflows()) == 0 {
 		return errorutil.New("No templates available")
 	}
@@ -184,9 +196,12 @@ func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *ty
 		httpOpts.Timeout = 20 * time.Second // for stability reasons
 		if opts.Timeout > 20 {
 			httpOpts.Timeout = time.Duration(opts.Timeout) * time.Second
+		} else if opts.Timeout > 0 {
+			// 修复 BUG：即使 timeout <= 20 也要使用配置的值
+			httpOpts.Timeout = time.Duration(opts.Timeout) * time.Second
 		}
-		// in testing it was found most of times when interactsh failed, it was due to failure in registering /polling requests
-		httpclient = retryablehttp.NewClient(retryablehttp.DefaultOptionsSingle)
+		// 修复 BUG：使用修改后的 httpOpts 而不是 DefaultOptionsSingle
+		httpclient = retryablehttp.NewClient(httpOpts)
 	}
 	var outputWriter output.Writer
 	outputWriter, err = output.NewStandardWriter(opts)
@@ -220,9 +235,9 @@ func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *ty
 		DoNotCache:      true, // 多任务环境下必须禁止缓存，不然回调无法同步
 	}
 	if opts.ShouldUseHostError() {
-		u.executeOpts.HostErrorsCache = hosterrorscache.New(30, hosterrorscache.DefaultMaxHostsCount, nil)
+		u.executeOpts.HostErrorsCache = hosterrorscache.New(10, hosterrorscache.DefaultMaxHostsCount, nil)
 	}
 	u.engine = core.New(opts)
-	u.engine.SetExecuterOptions(u.executeOpts)
+	u.engine.SetExecuterOptions(&u.executeOpts)
 	return u, nil
 }
