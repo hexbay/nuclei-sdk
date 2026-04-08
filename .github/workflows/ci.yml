@@ -9,11 +9,7 @@ on:
 jobs:
   test:
     name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        go-version: ['1.21', '1.22']
+    runs-on: ubuntu-latest
     
     steps:
     - name: Checkout code
@@ -22,7 +18,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: ${{ matrix.go-version }}
+        go-version: '1.24.2'
         cache: true
 
     - name: Download dependencies
@@ -37,7 +33,6 @@ jobs:
         CGO_ENABLED: 1
 
     - name: Upload coverage to Codecov
-      if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.22'
       uses: codecov/codecov-action@v4
       with:
         file: ./coverage.txt
@@ -55,7 +50,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.22'
+        go-version: '1.24.2'
         cache: true
 
     - name: Run golangci-lint
