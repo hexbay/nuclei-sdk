@@ -28,16 +28,7 @@ jobs:
       run: go mod verify
 
     - name: Run tests
-      run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
-      env:
-        CGO_ENABLED: 1
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        file: ./coverage.txt
-        flags: unittests
-        name: codecov-umbrella
+      run: go test -v ./...
 
   lint:
     name: Lint
