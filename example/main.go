@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 
-	"github.com/projectdiscovery/nuclei/v3/pkg/output"
 	"github.com/projectdiscovery/nuclei/v3/pkg/testutils"
 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
 	nucleiSDK "github.com/tongchengbin/nuclei-sdk"
@@ -48,37 +47,8 @@ func main() {
 			continue
 		}
 		os.Stdout.Write(data)
-		os.Stdout.Write([]byte("\n"))
+		os.Stdout.WriteString("\n")
 	}
 
 	log.Printf("Scan completed. Found %d results", len(results))
-}
-
-// 如果需要自定义回调函数处理结果
-func exampleWithCallback() {
-	sdk, err := nucleiSDK.NewSDK(testutils.DefaultOptions)
-	if err != nil {
-		log.Fatalf("Failed to create SDK: %v", err)
-	}
-
-	targets := []string{"https://example.com"}
-
-	// 使用回调函数处理每个结果
-	err = sdk.ExecuteNucleiWithOptsCtx(
-		context.Background(),
-		targets,
-		func(event *output.ResultEvent) error {
-			// 实时处理每个结果
-			log.Printf("[%s] %s - %s", event.Info.SeverityHolder.Severity, event.TemplateID, event.Matched)
-			return nil
-		},
-		nucleiSDK.SDKOptions(func(opts *types.Options) error {
-			opts.Templates = []string{"example/cyberpanel-rce.yaml"}
-			return nil
-		}),
-	)
-
-	if err != nil {
-		log.Fatalf("Scan failed: %v", err)
-	}
 }

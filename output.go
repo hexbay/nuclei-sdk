@@ -32,7 +32,7 @@ func (c *CallOutput) RequestStatsLog(statusCode, response string) {
 
 }
 
-func (c *CallOutput) WriteStoreDebugData(host, templateID, eventType string, data string) {
+func (c *CallOutput) WriteStoreDebugData(host, templateID, eventType, data string) {
 
 }
 
