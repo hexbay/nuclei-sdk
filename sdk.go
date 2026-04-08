@@ -137,6 +137,19 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 	if err != nil {
 		return err
 	}
+	// 确保 ExecutionId 已设置（避免 loader.New 内部重新生成）
+	if baseOpts.ExecutionId == "" {
+		baseOpts.ExecutionId = xid.New().String()
+	}
+
+	// 初始化协议状态（参考 nuclei 官方 lib/sdk_private.go:128-130）
+	// 必须在 loader.New 之前调用，因为 loader 会检查 dialers
+	if protocolstate.ShouldInit(baseOpts.ExecutionId) {
+		if err := protocolinit.Init(&baseOpts); err != nil {
+			return errorutil.New("Could not initialize protocols: %s\n", err)
+		}
+	}
+
 	// 非线程安全 需要关闭的资源
 	unsafeOpts, err := createEphemeralObjects(ctx, n.safeOptions, &baseOpts, callback)
 	if err != nil {
@@ -144,13 +157,6 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 	}
 	// cleanup and stop all resources
 	defer unsafeOpts.Close()
-
-	// 初始化协议状态（参考 nuclei 官方 lib/sdk_private.go:128-130）
-	if protocolstate.ShouldInit(baseOpts.ExecutionId) {
-		if err := protocolinit.Init(&baseOpts); err != nil {
-			return errorutil.New("Could not initialize protocols: %s\n", err)
-		}
-	}
 
 	// load templates
 	workflowLoader, err := workflow.NewLoader(&unsafeOpts.executeOpts)
