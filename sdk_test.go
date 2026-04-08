@@ -31,11 +31,11 @@ func TestInteractsh(t *testing.T) {
 	sdk, err := NewSDK(testutils.DefaultOptions)
 	assert.Nil(t, err)
 	assert.NotNil(t, sdk)
-	
+
 	// 获取当前工作目录并构建绝对路径
 	wd, _ := os.Getwd()
 	templatePath := filepath.Join(wd, "tests", "templates")
-	
+
 	result, err := sdk.ExecuteNucleiWithResult(context.Background(), []string{ts.URL}, SDKOptions(func(opts *types.Options) error {
 		opts.Templates = []string{templatePath}
 		opts.UpdateTemplates = false
@@ -77,11 +77,11 @@ func TestScanMultGlobalCallback(t *testing.T) {
 	sdk, err := NewSDK(testutils.DefaultOptions)
 	assert.Nil(t, err)
 	assert.NotNil(t, sdk)
-	
+
 	// 获取当前工作目录并构建绝对路径
 	wd, _ := os.Getwd()
 	templatePath := filepath.Join(wd, "tests", "templates", "interactsh.yaml")
-	
+
 	for i := 0; i < 3; i++ {
 		results, err := sdk.ExecuteNucleiWithResult(context.Background(), []string{ts.URL}, SDKOptions(func(opts *types.Options) error {
 			opts.Templates = []string{templatePath}
