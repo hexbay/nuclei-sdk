@@ -33,7 +33,6 @@ import (
 
 // NucleiSDK 它封装了 nuclei 引擎的核心功能
 type NucleiSDK struct {
-	//
 	ctx context.Context
 	// Core components
 	options       *types.Options
@@ -74,13 +73,13 @@ func NewSDK(opts *types.Options) (*NucleiSDK, error) {
 	if opts.Logger == nil {
 		opts.Logger = &gologger.Logger{}
 	}
-	
+
 	// 初始化 ExecutionId（参考 nuclei 官方 pkg/types/types.go:799）
 	// 这对于 protocolstate 的正确初始化至关重要
 	if opts.ExecutionId == "" {
 		opts.ExecutionId = xid.New().String()
 	}
-	
+
 	// Configure logging based on options
 	if opts.Verbose {
 		opts.Logger.SetMaxLevel(levels.LevelVerbose)
@@ -138,7 +137,7 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 	if err != nil {
 		return err
 	}
-	//非线程安全 需要关闭的资源
+	// 非线程安全 需要关闭的资源
 	unsafeOpts, err := createEphemeralObjects(ctx, n.safeOptions, &baseOpts, callback)
 	if err != nil {
 		return err
