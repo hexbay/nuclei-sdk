@@ -17,7 +17,18 @@ import (
 	"github.com/zeebo/assert"
 )
 
+// TestInteractsh 验证 SDK 能正确执行 interactsh 模板，并产出预期的扫描结果。
+// 测试目的：
+// 1. 加载 tests/templates/interactsh.yaml 模板。
+// 2. 让本地 HTTP 服务读取模板发来的 url 头，并主动访问该 interactsh 地址。
+// 3. 验证 SDK 最终能够接收到由 interactsh 回连触发的结果事件。
+// 预期结果：
+// 1. ExecuteNucleiWithResult 执行成功，不返回错误。
+// 2. 返回结果数量大于 0。
+// 3. 第一条结果的 TemplateID 为 interactsh-integration-test，说明命中的是预期模板。
 func TestInteractsh(t *testing.T) {
+	t.Helper()
+
 	router := httprouter.New()
 	router.GET("/", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 		value := r.Header.Get("url")
@@ -34,9 +45,7 @@ func TestInteractsh(t *testing.T) {
 	assert.Nil(t, err)
 	assert.NotNil(t, sdk)
 
-	// 获取当前工作目录并构建绝对路径
-	wd, _ := os.Getwd()
-	templatePath := filepath.Join(wd, "tests", "templates")
+	templatePath := filepath.Join("tests", "templates", "interactsh.yaml")
 
 	result, err := sdk.ExecuteNucleiWithResult(context.Background(), []string{ts.URL}, SDKOptions(func(opts *types.Options) error {
 		opts.Templates = []string{templatePath}
@@ -45,6 +54,7 @@ func TestInteractsh(t *testing.T) {
 	}))
 	assert.Nil(t, err)
 	assert.True(t, len(result) > 0)
+	assert.Equal(t, "interactsh-integration-test", result[0].TemplateID)
 }
 
 func TestScanWithResult(t *testing.T) {
