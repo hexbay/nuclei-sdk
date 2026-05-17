@@ -1,4 +1,4 @@
-module github.com/tongchengbin/nuclei-sdk
+module github.com/hexbay/nuclei-sdk
 
 go 1.24.2
 

@@ -48,7 +48,7 @@
 ### 升级依赖
 ```bash
 cd your-project
-go get -u github.com/tongchengbin/nuclei-sdk@latest
+go get -u github.com/hexbay/nuclei-sdk@latest
 go mod tidy
 ```
 

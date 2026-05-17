@@ -8,7 +8,7 @@ import (
 
 	"github.com/projectdiscovery/nuclei/v3/pkg/testutils"
 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
-	nucleiSDK "github.com/tongchengbin/nuclei-sdk"
+	nucleiSDK "github.com/hexbay/nuclei-sdk"
 )
 
 func main() {
