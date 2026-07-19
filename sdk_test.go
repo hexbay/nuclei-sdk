@@ -14,6 +14,7 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/testutils"
 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
 	"github.com/projectdiscovery/retryablehttp-go"
+	fileutil "github.com/projectdiscovery/utils/file"
 	"github.com/zeebo/assert"
 )
 
@@ -106,6 +107,34 @@ func TestScanMultGlobalCallback(t *testing.T) {
 
 }
 
+func TestRepeatedProjectScansCleanupTemporaryHmap(t *testing.T) {
+	sdk, err := NewSDK(testutils.DefaultOptions)
+	assert.Nil(t, err)
+	assert.NotNil(t, sdk)
+
+	before := tempDirsByExecutableName(t)
+	getHitTimes, templatePath, targetURL := newRateLimitFixture(t, 0)
+
+	for i := 0; i < 3; i++ {
+		_, err := sdk.ExecuteNucleiWithResult(context.Background(), []string{targetURL}, SDKOptions(func(opts *types.Options) error {
+			opts.Templates = []string{templatePath}
+			opts.UpdateTemplates = false
+			opts.Project = true
+			opts.ProjectPath = ""
+			opts.Timeout = 5
+			return nil
+		}))
+		assert.Nil(t, err)
+	}
+
+	after := tempDirsByExecutableName(t)
+	for dir := range before {
+		delete(after, dir)
+	}
+	assert.Equal(t, 0, len(after))
+	assert.Equal(t, 3, len(getHitTimes()))
+}
+
 // TestRateLimiterAndBulkSizeMatrix 验证 RateLimit 和 BulkSize 组合对请求到达节奏的影响。
 // 测试目标：
 // 1. 单次 Execute 中放入两个 target，使 BulkSize 能直接影响调度并发度。
@@ -115,11 +144,11 @@ func TestRateLimiterAndBulkSizeMatrix(t *testing.T) {
 	t.Parallel()
 
 	testCases := []struct {
-		name       string
-		rateLimit  int
-		bulkSize   int
-		minGap     time.Duration
-		maxGap     time.Duration
+		name      string
+		rateLimit int
+		bulkSize  int
+		minGap    time.Duration
+		maxGap    time.Duration
 	}{
 		{
 			name:      "rate_limit_2_bulk_size_1",
@@ -221,4 +250,20 @@ func runSingleScanWithTargets(t *testing.T, sdk *NucleiSDK, templatePath string,
 		return nil
 	}))
 	assert.Nil(t, err)
+}
+
+func tempDirsByExecutableName(t *testing.T) map[string]struct{} {
+	t.Helper()
+
+	entries, err := os.ReadDir(os.TempDir())
+	assert.Nil(t, err)
+
+	executableName := fileutil.ExecutableName()
+	dirs := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), executableName) {
+			dirs[filepath.Join(os.TempDir(), entry.Name())] = struct{}{}
+		}
+	}
+	return dirs
 }

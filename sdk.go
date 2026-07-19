@@ -2,16 +2,10 @@ package nucleiSDK
 
 import (
 	"context"
-	"github.com/logrusorgru/aurora"
-	"github.com/projectdiscovery/nuclei/v3/pkg/progress"
-	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/hosterrorscache"
-	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/interactsh"
-	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/httpclientpool"
-	"github.com/projectdiscovery/ratelimit"
-	"github.com/projectdiscovery/retryablehttp-go"
 	"sync"
 	"time"
 
+	"github.com/logrusorgru/aurora"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/gologger/levels"
 	"github.com/projectdiscovery/nuclei/v3/pkg/catalog"
@@ -19,14 +13,22 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/catalog/disk"
 	"github.com/projectdiscovery/nuclei/v3/pkg/catalog/loader"
 	"github.com/projectdiscovery/nuclei/v3/pkg/core"
+	"github.com/projectdiscovery/nuclei/v3/pkg/input"
 	"github.com/projectdiscovery/nuclei/v3/pkg/input/provider"
 	"github.com/projectdiscovery/nuclei/v3/pkg/loader/workflow"
 	"github.com/projectdiscovery/nuclei/v3/pkg/output"
+	"github.com/projectdiscovery/nuclei/v3/pkg/progress"
+	"github.com/projectdiscovery/nuclei/v3/pkg/projectfile"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/hosterrorscache"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/interactsh"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolinit"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/httpclientpool"
 	"github.com/projectdiscovery/nuclei/v3/pkg/templates"
 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
+	"github.com/projectdiscovery/ratelimit"
+	"github.com/projectdiscovery/retryablehttp-go"
 	errorutil "github.com/projectdiscovery/utils/errors"
 	"github.com/rs/xid"
 )
@@ -53,6 +55,7 @@ type SafeOptions struct {
 type UnsafeOptions struct {
 	executeOpts protocols.ExecutorOptions
 	engine      *core.Engine
+	executionID string
 }
 
 func (u *UnsafeOptions) Close() {
@@ -61,6 +64,24 @@ func (u *UnsafeOptions) Close() {
 	}
 	if u.executeOpts.Progress != nil {
 		u.executeOpts.Progress.Stop()
+	}
+	if u.executeOpts.Output != nil {
+		u.executeOpts.Output.Close()
+	}
+	if u.executeOpts.HostErrorsCache != nil {
+		u.executeOpts.HostErrorsCache.Close()
+	}
+	if u.executeOpts.ProjectFile != nil {
+		u.executeOpts.ProjectFile.Close()
+	}
+	if u.executeOpts.Browser != nil {
+		u.executeOpts.Browser.Close()
+	}
+	if u.executeOpts.InputHelper != nil {
+		_ = u.executeOpts.InputHelper.Close()
+	}
+	if u.executionID != "" {
+		protocolinit.Close(u.executionID)
 	}
 }
 
@@ -128,6 +149,7 @@ func (n *NucleiSDK) ExecuteNucleiWithResult(ctx context.Context, targets []strin
 func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []string, callback ResultCallback, opts ...SDKOptions) error {
 	//	所有的初始化都需要在这里进行
 	baseOpts := *n.options
+	baseExecutionID := baseOpts.ExecutionId
 	for _, opt := range opts {
 		if err := opt(&baseOpts); err != nil {
 			return err
@@ -137,8 +159,8 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 	if err != nil {
 		return err
 	}
-	// 确保 ExecutionId 已设置（避免 loader.New 内部重新生成）
-	if baseOpts.ExecutionId == "" {
+	// 每次执行使用独立 ExecutionId，避免清理 protocol state 时影响并发扫描。
+	if baseOpts.ExecutionId == "" || baseOpts.ExecutionId == baseExecutionID {
 		baseOpts.ExecutionId = xid.New().String()
 	}
 
@@ -172,6 +194,7 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 		return errorutil.New("Could not load templates: %s\n", err)
 	}
 	inputProvider := provider.NewSimpleInputProviderWithUrls("", targets...)
+	defer inputProvider.Close()
 	if len(store.Templates()) == 0 && len(store.Workflows()) == 0 {
 		return errorutil.New("No templates available")
 	}
@@ -185,7 +208,7 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 
 // createEphemeralObjects creates ephemeral nuclei objects/instances/types
 func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *types.Options, callback ResultCallback) (*UnsafeOptions, error) {
-	u := &UnsafeOptions{}
+	u := &UnsafeOptions{executionID: opts.ExecutionId}
 	progressImpl, _ := progress.NewStatsTicker(0, false, false, false, 0)
 	// init http client
 	var httpclient *retryablehttp.Client
@@ -211,6 +234,7 @@ func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *ty
 	var outputWriter output.Writer
 	outputWriter, err = output.NewStandardWriter(opts)
 	if err != nil {
+		progressImpl.Stop()
 		return nil, err
 	}
 	if callback != nil {
@@ -221,7 +245,19 @@ func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *ty
 	interactshOpts.HTTPClient = httpclient
 	interactshClient, err := interactsh.New(interactshOpts)
 	if err != nil {
+		outputWriter.Close()
+		progressImpl.Stop()
 		return nil, err
+	}
+	var projectFile *projectfile.ProjectFile
+	if opts.Project || opts.ProjectPath != "" {
+		projectFile, err = projectfile.New(&projectfile.Options{Path: opts.ProjectPath, Cleanup: opts.ProjectPath == ""})
+		if err != nil {
+			interactshClient.Close()
+			outputWriter.Close()
+			progressImpl.Stop()
+			return nil, err
+		}
 	}
 	// todo 这里可以判断limit 是否变化、针对特定任务实现速率控制、一般情况下不需要
 	u.executeOpts = protocols.ExecutorOptions{
@@ -232,11 +268,13 @@ func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *ty
 		IssuesClient:    nil,
 		RateLimiter:     safeOpts.rateLimiter,
 		Interactsh:      interactshClient,
+		ProjectFile:     projectFile,
 		HostErrorsCache: nil,
 		Colorizer:       aurora.NewAurora(true),
 		ResumeCfg:       types.NewResumeCfg(),
 		Parser:          safeOpts.parser,
 		Browser:         nil,
+		InputHelper:     input.NewHelper(),
 		DoNotCache:      true, // 多任务环境下必须禁止缓存，不然回调无法同步
 	}
 	if opts.ShouldUseHostError() {
