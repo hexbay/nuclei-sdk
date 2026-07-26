@@ -3,6 +3,7 @@ package nucleiSDK
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -13,7 +14,6 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/catalog/config"
 	"github.com/projectdiscovery/nuclei/v3/pkg/catalog/disk"
 	"github.com/projectdiscovery/nuclei/v3/pkg/catalog/loader"
-	"github.com/projectdiscovery/nuclei/v3/pkg/core"
 	"github.com/projectdiscovery/nuclei/v3/pkg/input"
 	"github.com/projectdiscovery/nuclei/v3/pkg/input/provider"
 	"github.com/projectdiscovery/nuclei/v3/pkg/loader/workflow"
@@ -21,11 +21,13 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/progress"
 	"github.com/projectdiscovery/nuclei/v3/pkg/projectfile"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/contextargs"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/hosterrorscache"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/interactsh"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolinit"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/httpclientpool"
+	"github.com/projectdiscovery/nuclei/v3/pkg/scan"
 	"github.com/projectdiscovery/nuclei/v3/pkg/templates"
 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
 	"github.com/projectdiscovery/ratelimit"
@@ -42,10 +44,15 @@ type NucleiSDK struct {
 	// Result handling
 	Callback func(*output.ResultEvent) // Executed on results
 	// Lifecycle
-	mutex       sync.Mutex
-	tasks       sync.WaitGroup
-	closed      bool
-	safeOptions *SafeOptions
+	mutex         sync.Mutex
+	tasks         sync.WaitGroup
+	closed        bool
+	safeOptions   *SafeOptions
+	runtime       *UnsafeOptions
+	store         *loader.Store
+	templateMu    sync.Mutex
+	templateSets  map[string][]*templates.Template
+	templateLoads int
 }
 
 // SafeOptions 包含公共参数，单例模式
@@ -56,7 +63,6 @@ type SafeOptions struct {
 }
 type UnsafeOptions struct {
 	executeOpts protocols.ExecutorOptions
-	engine      *core.Engine
 }
 
 func (u *UnsafeOptions) Close() {
@@ -83,6 +89,8 @@ func (u *UnsafeOptions) Close() {
 	}
 }
 
+// SDKOptions may select templates and adjust task scheduling. Options that
+// affect protocol or template compilation must be supplied to NewSDK.
 type SDKOptions func(opts *types.Options) error
 
 var ErrSDKClosed = errors.New("nuclei SDK is closed")
@@ -131,16 +139,44 @@ func NewSDK(opts *types.Options) (*NucleiSDK, error) {
 		parser:      templates.NewParser(),
 		rateLimiter: rateLimiter,
 	}
+	if err := loadProxyServers(opts); err != nil {
+		rateLimiter.Stop()
+		return nil, err
+	}
 	if err := protocolinit.Init(opts); err != nil {
 		rateLimiter.Stop()
 		return nil, errorutil.New("Could not initialize protocols: %s\n", err)
 	}
 	// Create SDK instance
 	sdk := &NucleiSDK{
-		ctx:         ctx,
-		options:     opts,
-		safeOptions: safeOptions,
+		ctx:          ctx,
+		options:      opts,
+		safeOptions:  safeOptions,
+		templateSets: make(map[string][]*templates.Template),
 	}
+	runtime, err := createSharedObjects(ctx, safeOptions, opts)
+	if err != nil {
+		protocolinit.Close(opts.ExecutionId)
+		rateLimiter.Stop()
+		return nil, err
+	}
+	workflowLoader, err := workflow.NewLoader(&runtime.executeOpts)
+	if err != nil {
+		runtime.Close()
+		protocolinit.Close(opts.ExecutionId)
+		rateLimiter.Stop()
+		return nil, errorutil.New("Could not create workflow loader: %s\n", err)
+	}
+	runtime.executeOpts.WorkflowLoader = workflowLoader
+	store, err := loader.New(loader.NewConfig(opts, safeOptions.catalog, &runtime.executeOpts))
+	if err != nil {
+		runtime.Close()
+		protocolinit.Close(opts.ExecutionId)
+		rateLimiter.Stop()
+		return nil, errorutil.New("Could not create loader client: %s\n", err)
+	}
+	sdk.runtime = runtime
+	sdk.store = store
 	gologger.Debug().Msgf("Initialized NucleiSDK with options: %+v", opts)
 	return sdk, nil
 }
@@ -156,6 +192,7 @@ func (n *NucleiSDK) Close() error {
 	n.mutex.Unlock()
 
 	n.tasks.Wait()
+	n.runtime.Close()
 	protocolinit.Close(n.options.ExecutionId)
 	n.safeOptions.rateLimiter.Stop()
 	return nil
@@ -191,50 +228,183 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 	}
 	// Execution-scoped options cannot replace the SDK-owned protocol state.
 	baseOpts.ExecutionId = n.options.ExecutionId
-	err := loadProxyServers(baseOpts)
-	if err != nil {
-		return err
-	}
 	if protocolstate.ShouldInit(baseOpts.ExecutionId) {
 		return errorutil.New("protocol state for SDK execution %s is not initialized\n", baseOpts.ExecutionId)
 	}
-
-	// 非线程安全 需要关闭的资源
-	unsafeOpts, err := createEphemeralObjects(ctx, n.safeOptions, baseOpts, callback)
+	loadedTemplates, err := n.loadTemplates(baseOpts)
 	if err != nil {
 		return err
 	}
-	// cleanup and stop all resources
-	defer unsafeOpts.Close()
-
-	// load templates
-	workflowLoader, err := workflow.NewLoader(&unsafeOpts.executeOpts)
-	if err != nil {
-		return errorutil.New("Could not create workflow loader: %s\n", err)
-	}
-	unsafeOpts.executeOpts.WorkflowLoader = workflowLoader
-	store, err := loader.New(loader.NewConfig(baseOpts, n.safeOptions.catalog, &unsafeOpts.executeOpts))
-	if err != nil {
-		return errorutil.New("Could not create loader client: %s\n", err)
-	}
-	if err := store.Load(); err != nil {
-		return errorutil.New("Could not load templates: %s\n", err)
-	}
 	inputProvider := provider.NewSimpleInputProviderWithUrls(baseOpts.ExecutionId, targets...)
 	defer inputProvider.Close()
-	if len(store.Templates()) == 0 && len(store.Workflows()) == 0 {
-		return errorutil.New("No templates available")
-	}
 	if inputProvider.Count() == 0 {
 		return errorutil.New("No targets available")
 	}
-	_ = unsafeOpts.engine.ExecuteScanWithOpts(ctx, store.Templates(), inputProvider, false)
-	unsafeOpts.engine.WorkPool().Wait()
-	return nil
+	return executeTemplates(ctx, inputProvider, loadedTemplates, callback, baseOpts)
 }
 
-// createEphemeralObjects creates ephemeral nuclei objects/instances/types
-func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *types.Options, callback ResultCallback) (*UnsafeOptions, error) {
+func (n *NucleiSDK) loadTemplates(opts *types.Options) ([]*templates.Template, error) {
+	if len(opts.Workflows) > 0 || len(opts.WorkflowURLs) > 0 {
+		return nil, errors.New("workflows are not supported by the shared execution path")
+	}
+	paths := append([]string(nil), opts.Templates...)
+	paths = append(paths, opts.TemplateURLs...)
+	sort.Strings(paths)
+
+	n.templateMu.Lock()
+	defer n.templateMu.Unlock()
+	if len(paths) == 0 {
+		const allTemplates = "__all__"
+		if cached, ok := n.templateSets[allTemplates]; ok {
+			return cached, nil
+		}
+		if err := n.store.Load(); err != nil {
+			return nil, errorutil.New("Could not load templates: %s\n", err)
+		}
+		loaded := n.store.Templates()
+		if len(loaded) == 0 {
+			return nil, errorutil.New("No templates available")
+		}
+		n.templateSets[allTemplates] = loaded
+		n.templateLoads++
+		return loaded, nil
+	}
+
+	loaded := make([]*templates.Template, 0)
+	for _, path := range paths {
+		pathTemplates, ok := n.templateSets[path]
+		if !ok {
+			var err error
+			pathTemplates, err = n.store.LoadTemplates([]string{path})
+			if err != nil {
+				return nil, errorutil.New("Could not load templates: %s\n", err)
+			}
+			n.templateSets[path] = pathTemplates
+			n.templateLoads++
+		}
+		loaded = append(loaded, pathTemplates...)
+	}
+	if len(loaded) == 0 {
+		return nil, errorutil.New("No templates available")
+	}
+	return loaded, nil
+}
+
+func executeTemplates(ctx context.Context, inputProvider *provider.SimpleInputProvider, loadedTemplates []*templates.Template, callback ResultCallback, opts *types.Options) error {
+	var executionErr error
+	var errorMu sync.Mutex
+	var pendingMu sync.Mutex
+	var pending []*output.InternalWrappedEvent
+
+	recordError := func(err error) {
+		if err == nil {
+			return
+		}
+		errorMu.Lock()
+		if executionErr == nil {
+			executionErr = err
+		}
+		errorMu.Unlock()
+	}
+	onResult := func(event *output.InternalWrappedEvent) {
+		event.RLock()
+		results := append([]*output.ResultEvent(nil), event.Results...)
+		usesInteractsh := event.UsesInteractsh
+		event.RUnlock()
+		if len(results) == 0 && usesInteractsh {
+			pendingMu.Lock()
+			pending = append(pending, event)
+			pendingMu.Unlock()
+			return
+		}
+		for _, result := range results {
+			if callback != nil {
+				recordError(callback(result))
+			}
+		}
+	}
+
+	concurrency := opts.BulkSize
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	workers := make(chan struct{}, concurrency)
+	var wait sync.WaitGroup
+	inputProvider.Iterate(func(target *contextargs.MetaInput) bool {
+		for _, template := range loadedTemplates {
+			if ctx.Err() != nil {
+				recordError(ctx.Err())
+				return false
+			}
+			workers <- struct{}{}
+			wait.Add(1)
+			go func(target *contextargs.MetaInput, template *templates.Template) {
+				defer wait.Done()
+				defer func() { <-workers }()
+				if template.Executer == nil {
+					recordError(errorutil.New("template %s has no executable requests", template.ID))
+					return
+				}
+				input := contextargs.New(ctx)
+				input.MetaInput = target
+				scanCtx := scan.NewScanContext(ctx, input)
+				scanCtx.OnResult = onResult
+				if _, err := template.Executer.ExecuteWithResults(scanCtx); err != nil {
+					recordError(err)
+				}
+			}(target, template)
+		}
+		return true
+	})
+	wait.Wait()
+
+	waitForInteractsh(ctx, pending, callback, recordError, opts)
+	return executionErr
+}
+
+func waitForInteractsh(ctx context.Context, pending []*output.InternalWrappedEvent, callback ResultCallback, recordError func(error), opts *types.Options) {
+	if len(pending) == 0 {
+		return
+	}
+	cooldown := time.Duration(opts.InteractionsCoolDownPeriod) * time.Second
+	if cooldown <= 0 {
+		cooldown = 10 * time.Second
+	}
+	timer := time.NewTimer(cooldown)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	remaining := append([]*output.InternalWrappedEvent(nil), pending...)
+	for len(remaining) > 0 {
+		select {
+		case <-ctx.Done():
+			recordError(ctx.Err())
+			return
+		case <-timer.C:
+			return
+		case <-ticker.C:
+			next := remaining[:0]
+			for _, event := range remaining {
+				if !event.InteractshMatched.Load() {
+					next = append(next, event)
+					continue
+				}
+				event.RLock()
+				results := append([]*output.ResultEvent(nil), event.Results...)
+				event.RUnlock()
+				for _, result := range results {
+					if callback != nil {
+						recordError(callback(result))
+					}
+				}
+			}
+			remaining = next
+		}
+	}
+}
+
+// createSharedObjects creates resources owned by the SDK.
+func createSharedObjects(ctx context.Context, safeOpts *SafeOptions, opts *types.Options) (*UnsafeOptions, error) {
 	u := &UnsafeOptions{}
 	progressInitMutex.Lock()
 	progressImpl, _ := progress.NewStatsTicker(0, false, false, false, 0)
@@ -265,10 +435,6 @@ func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *ty
 	if err != nil {
 		progressImpl.Stop()
 		return nil, err
-	}
-	if callback != nil {
-		outputWriter = output.NewMultiWriter(outputWriter, NewCallOutput(callback))
-
 	}
 	interactshOpts := interactsh.DefaultOptions(outputWriter, nil, progressImpl)
 	interactshOpts.HTTPClient = httpclient
@@ -309,7 +475,5 @@ func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *ty
 	if opts.ShouldUseHostError() {
 		u.executeOpts.HostErrorsCache = hosterrorscache.New(10, hosterrorscache.DefaultMaxHostsCount, nil)
 	}
-	u.engine = core.New(opts)
-	u.engine.SetExecuterOptions(&u.executeOpts)
 	return u, nil
 }

@@ -192,6 +192,26 @@ func TestConcurrentExecutionsKeepResultsTaskLocal(t *testing.T) {
 	}
 }
 
+func TestTemplateSelectionLoadsOncePerSDK(t *testing.T) {
+	sdk := newRateLimitedSDKForTest(t, 0, 1)
+	t.Cleanup(func() { _ = sdk.Close() })
+	_, templatePath, targetURL := newRateLimitFixture(t, 0)
+
+	execute := func() {
+		results, err := sdk.ExecuteNucleiWithResult(context.Background(), []string{targetURL}, SDKOptions(func(opts *types.Options) error {
+			opts.Templates = []string{templatePath}
+			return nil
+		}))
+		assert.Nil(t, err)
+		assert.Equal(t, 1, len(results))
+	}
+
+	execute()
+	execute()
+	assert.Equal(t, 1, len(sdk.templateSets))
+	assert.Equal(t, 1, sdk.templateLoads)
+}
+
 // TestRateLimiterAndBulkSizeMatrix 验证 RateLimit 和 BulkSize 组合对请求到达节奏的影响。
 // 测试目标：
 // 1. 单次 Execute 中放入两个 target，使 BulkSize 能直接影响调度并发度。
