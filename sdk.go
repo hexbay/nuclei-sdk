@@ -2,6 +2,7 @@ package nucleiSDK
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -37,12 +38,13 @@ import (
 type NucleiSDK struct {
 	ctx context.Context
 	// Core components
-	options       *types.Options
-	templateStore map[string]*templates.Template
+	options *types.Options
 	// Result handling
 	Callback func(*output.ResultEvent) // Executed on results
-	// Thread safety
-	mutex       sync.RWMutex
+	// Lifecycle
+	mutex       sync.Mutex
+	tasks       sync.WaitGroup
+	closed      bool
 	safeOptions *SafeOptions
 }
 
@@ -55,7 +57,6 @@ type SafeOptions struct {
 type UnsafeOptions struct {
 	executeOpts protocols.ExecutorOptions
 	engine      *core.Engine
-	executionID string
 }
 
 func (u *UnsafeOptions) Close() {
@@ -80,26 +81,30 @@ func (u *UnsafeOptions) Close() {
 	if u.executeOpts.InputHelper != nil {
 		_ = u.executeOpts.InputHelper.Close()
 	}
-	if u.executionID != "" {
-		protocolinit.Close(u.executionID)
-	}
 }
 
 type SDKOptions func(opts *types.Options) error
 
+var ErrSDKClosed = errors.New("nuclei SDK is closed")
+
+// Nuclei's progress constructor updates package-level state.
+var progressInitMutex sync.Mutex
+
 // NewSDK 返回一个新的 NucleiSDK 实例
 // 初始化所有必要的组件，包括日志级别、协议、工作池和目录
 func NewSDK(opts *types.Options) (*NucleiSDK, error) {
+	if opts == nil {
+		return nil, errors.New("nuclei SDK options cannot be nil")
+	}
+	opts = opts.Copy()
+
 	// 初始化 Logger（参考 nuclei 官方 pkg/types/types.go:800）
 	if opts.Logger == nil {
 		opts.Logger = &gologger.Logger{}
 	}
 
-	// 初始化 ExecutionId（参考 nuclei 官方 pkg/types/types.go:799）
-	// 这对于 protocolstate 的正确初始化至关重要
-	if opts.ExecutionId == "" {
-		opts.ExecutionId = xid.New().String()
-	}
+	// Protocol state belongs to the SDK and is shared by all executions.
+	opts.ExecutionId = xid.New().String()
 
 	// Configure logging based on options
 	if opts.Verbose {
@@ -126,54 +131,76 @@ func NewSDK(opts *types.Options) (*NucleiSDK, error) {
 		parser:      templates.NewParser(),
 		rateLimiter: rateLimiter,
 	}
+	if err := protocolinit.Init(opts); err != nil {
+		rateLimiter.Stop()
+		return nil, errorutil.New("Could not initialize protocols: %s\n", err)
+	}
 	// Create SDK instance
 	sdk := &NucleiSDK{
-		ctx:           ctx,
-		options:       opts,
-		templateStore: make(map[string]*templates.Template),
-		safeOptions:   safeOptions,
+		ctx:         ctx,
+		options:     opts,
+		safeOptions: safeOptions,
 	}
 	gologger.Debug().Msgf("Initialized NucleiSDK with options: %+v", opts)
 	return sdk, nil
 }
 
-func (n *NucleiSDK) ExecuteNucleiWithResult(ctx context.Context, targets []string, opts ...SDKOptions) ([]*output.ResultEvent, error) {
-	results := make([]*output.ResultEvent, 0)
-	callback := func(result *output.ResultEvent) error {
-		results = append(results, result)
+// Close waits for active executions and releases resources owned by the SDK.
+func (n *NucleiSDK) Close() error {
+	n.mutex.Lock()
+	if n.closed {
+		n.mutex.Unlock()
 		return nil
 	}
-	err := n.ExecuteNucleiWithOptsCtx(ctx, targets, callback, opts...)
-	return results, err
+	n.closed = true
+	n.mutex.Unlock()
+
+	n.tasks.Wait()
+	protocolinit.Close(n.options.ExecutionId)
+	n.safeOptions.rateLimiter.Stop()
+	return nil
+}
+
+func (n *NucleiSDK) beginExecution() error {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	if n.closed {
+		return ErrSDKClosed
+	}
+	n.tasks.Add(1)
+	return nil
+}
+
+func (n *NucleiSDK) ExecuteNucleiWithResult(ctx context.Context, targets []string, opts ...SDKOptions) ([]*output.ResultEvent, error) {
+	collector := newResultCollector()
+	err := n.ExecuteNucleiWithOptsCtx(ctx, targets, collector.Write, opts...)
+	return collector.Results(), err
 }
 func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []string, callback ResultCallback, opts ...SDKOptions) error {
+	if err := n.beginExecution(); err != nil {
+		return err
+	}
+	defer n.tasks.Done()
+
 	//	所有的初始化都需要在这里进行
-	baseOpts := *n.options
-	baseExecutionID := baseOpts.ExecutionId
+	baseOpts := n.options.Copy()
 	for _, opt := range opts {
-		if err := opt(&baseOpts); err != nil {
+		if err := opt(baseOpts); err != nil {
 			return err
 		}
 	}
-	err := loadProxyServers(&baseOpts)
+	// Execution-scoped options cannot replace the SDK-owned protocol state.
+	baseOpts.ExecutionId = n.options.ExecutionId
+	err := loadProxyServers(baseOpts)
 	if err != nil {
 		return err
 	}
-	// 每次执行使用独立 ExecutionId，避免清理 protocol state 时影响并发扫描。
-	if baseOpts.ExecutionId == "" || baseOpts.ExecutionId == baseExecutionID {
-		baseOpts.ExecutionId = xid.New().String()
-	}
-
-	// 初始化协议状态（参考 nuclei 官方 lib/sdk_private.go:128-130）
-	// 必须在 loader.New 之前调用，因为 loader 会检查 dialers
 	if protocolstate.ShouldInit(baseOpts.ExecutionId) {
-		if err := protocolinit.Init(&baseOpts); err != nil {
-			return errorutil.New("Could not initialize protocols: %s\n", err)
-		}
+		return errorutil.New("protocol state for SDK execution %s is not initialized\n", baseOpts.ExecutionId)
 	}
 
 	// 非线程安全 需要关闭的资源
-	unsafeOpts, err := createEphemeralObjects(ctx, n.safeOptions, &baseOpts, callback)
+	unsafeOpts, err := createEphemeralObjects(ctx, n.safeOptions, baseOpts, callback)
 	if err != nil {
 		return err
 	}
@@ -186,14 +213,14 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 		return errorutil.New("Could not create workflow loader: %s\n", err)
 	}
 	unsafeOpts.executeOpts.WorkflowLoader = workflowLoader
-	store, err := loader.New(loader.NewConfig(&baseOpts, n.safeOptions.catalog, &unsafeOpts.executeOpts))
+	store, err := loader.New(loader.NewConfig(baseOpts, n.safeOptions.catalog, &unsafeOpts.executeOpts))
 	if err != nil {
 		return errorutil.New("Could not create loader client: %s\n", err)
 	}
 	if err := store.Load(); err != nil {
 		return errorutil.New("Could not load templates: %s\n", err)
 	}
-	inputProvider := provider.NewSimpleInputProviderWithUrls("", targets...)
+	inputProvider := provider.NewSimpleInputProviderWithUrls(baseOpts.ExecutionId, targets...)
 	defer inputProvider.Close()
 	if len(store.Templates()) == 0 && len(store.Workflows()) == 0 {
 		return errorutil.New("No templates available")
@@ -208,8 +235,10 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 
 // createEphemeralObjects creates ephemeral nuclei objects/instances/types
 func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *types.Options, callback ResultCallback) (*UnsafeOptions, error) {
-	u := &UnsafeOptions{executionID: opts.ExecutionId}
+	u := &UnsafeOptions{}
+	progressInitMutex.Lock()
 	progressImpl, _ := progress.NewStatsTicker(0, false, false, false, 0)
+	progressInitMutex.Unlock()
 	// init http client
 	var httpclient *retryablehttp.Client
 	var err error
@@ -275,7 +304,7 @@ func createEphemeralObjects(ctx context.Context, safeOpts *SafeOptions, opts *ty
 		Parser:          safeOpts.parser,
 		Browser:         nil,
 		InputHelper:     input.NewHelper(),
-		DoNotCache:      true, // 多任务环境下必须禁止缓存，不然回调无法同步
+		DoNotCache:      true,
 	}
 	if opts.ShouldUseHostError() {
 		u.executeOpts.HostErrorsCache = hosterrorscache.New(10, hosterrorscache.DefaultMaxHostsCount, nil)

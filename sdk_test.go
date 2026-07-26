@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/julienschmidt/httprouter"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
 	"github.com/projectdiscovery/nuclei/v3/pkg/testutils"
 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
 	"github.com/projectdiscovery/retryablehttp-go"
@@ -136,6 +137,61 @@ func TestRepeatedProjectScansCleanupTemporaryHmap(t *testing.T) {
 	assert.Equal(t, 3, len(getHitTimes()))
 }
 
+func TestSDKReusesProtocolStateAcrossExecutions(t *testing.T) {
+	sdk := newRateLimitedSDKForTest(t, 0, 1)
+	executionID := sdk.options.ExecutionId
+	dialers := protocolstate.GetDialersWithId(executionID)
+	assert.NotNil(t, dialers)
+
+	_, templatePath, targetURL := newRateLimitFixture(t, 0)
+	for i := 0; i < 3; i++ {
+		_, err := sdk.ExecuteNucleiWithResult(context.Background(), []string{targetURL}, SDKOptions(func(opts *types.Options) error {
+			opts.Templates = []string{templatePath}
+			return nil
+		}))
+		assert.Nil(t, err)
+		assert.Equal(t, dialers, protocolstate.GetDialersWithId(executionID))
+	}
+
+	assert.Nil(t, sdk.Close())
+	assert.Nil(t, protocolstate.GetDialersWithId(executionID))
+	assert.Error(t, sdk.ExecuteNucleiWithOptsCtx(context.Background(), []string{targetURL}, nil))
+}
+
+func TestConcurrentExecutionsKeepResultsTaskLocal(t *testing.T) {
+	const executions = 8
+
+	sdk := newRateLimitedSDKForTest(t, 0, 1)
+	t.Cleanup(func() { _ = sdk.Close() })
+	_, templatePath, targetURL := newRateLimitFixture(t, 50*time.Millisecond)
+
+	var wait sync.WaitGroup
+	errs := make(chan error, executions)
+	counts := make(chan int, executions)
+	for i := 0; i < executions; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			results, err := sdk.ExecuteNucleiWithResult(context.Background(), []string{targetURL}, SDKOptions(func(opts *types.Options) error {
+				opts.Templates = []string{templatePath}
+				return nil
+			}))
+			errs <- err
+			counts <- len(results)
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	close(counts)
+
+	for err := range errs {
+		assert.Nil(t, err)
+	}
+	for count := range counts {
+		assert.Equal(t, 1, count)
+	}
+}
+
 // TestRateLimiterAndBulkSizeMatrix 验证 RateLimit 和 BulkSize 组合对请求到达节奏的影响。
 // 测试目标：
 // 1. 单次 Execute 中放入两个 target，使 BulkSize 能直接影响调度并发度。
@@ -193,7 +249,7 @@ func TestRateLimiterAndBulkSizeMatrix(t *testing.T) {
 
 func newRateLimitedSDKForTest(t *testing.T, rateLimit, bulkSize int) *NucleiSDK {
 	t.Helper()
-	baseOpts := *testutils.DefaultOptions
+	baseOpts := testutils.DefaultOptions.Copy()
 	baseOpts.RateLimit = rateLimit
 	baseOpts.RateLimitDuration = time.Second
 	baseOpts.UpdateTemplates = false
@@ -205,7 +261,7 @@ func newRateLimitedSDKForTest(t *testing.T, rateLimit, bulkSize int) *NucleiSDK 
 	baseOpts.TemplateThreads = 1
 	baseOpts.HeadlessTemplateThreads = 1
 
-	sdk, err := NewSDK(&baseOpts)
+	sdk, err := NewSDK(baseOpts)
 	assert.Nil(t, err)
 	assert.NotNil(t, sdk)
 	return sdk

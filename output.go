@@ -1,6 +1,8 @@
 package nucleiSDK
 
 import (
+	"sync"
+
 	"github.com/logrusorgru/aurora"
 	"github.com/projectdiscovery/nuclei/v3/pkg/output"
 )
@@ -46,4 +48,28 @@ func NewCallOutput(callback ResultCallback) *CallOutput {
 	return &CallOutput{
 		callback: callback,
 	}
+}
+
+type resultCollector struct {
+	mutex   sync.Mutex
+	results []*output.ResultEvent
+}
+
+func newResultCollector() *resultCollector {
+	return &resultCollector{results: make([]*output.ResultEvent, 0)}
+}
+
+func (c *resultCollector) Write(event *output.ResultEvent) error {
+	c.mutex.Lock()
+	c.results = append(c.results, event)
+	c.mutex.Unlock()
+	return nil
+}
+
+func (c *resultCollector) Results() []*output.ResultEvent {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	results := make([]*output.ResultEvent, len(c.results))
+	copy(results, c.results)
+	return results
 }
