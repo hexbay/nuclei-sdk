@@ -2,6 +2,7 @@ package nucleiSDK
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/julienschmidt/httprouter"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
+	"github.com/projectdiscovery/nuclei/v3/pkg/templates"
 	"github.com/projectdiscovery/nuclei/v3/pkg/testutils"
 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
 	"github.com/projectdiscovery/retryablehttp-go"
@@ -210,6 +212,69 @@ func TestTemplateSelectionLoadsOncePerSDK(t *testing.T) {
 	execute()
 	assert.Equal(t, 1, len(sdk.templateSets))
 	assert.Equal(t, 1, sdk.templateLoads)
+}
+
+func TestTemplateCacheIsBounded(t *testing.T) {
+	baseOpts := testutils.DefaultOptions.Copy()
+	baseOpts.Silent = true
+	sdk, err := NewSDKWithRuntimeOptions(baseOpts, RuntimeOptions{
+		MaxConcurrentExecutions: 1,
+		MaxCachedTemplates:      2,
+	})
+	assert.Nil(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+
+	sdk.templateMu.Lock()
+	sdk.templateTick++
+	sdk.cacheTemplateSet("first", []*templates.Template{{ID: "one"}})
+	sdk.templateTick++
+	sdk.cacheTemplateSet("second", []*templates.Template{{ID: "two"}})
+	sdk.templateTick++
+	sdk.cacheTemplateSet("third", []*templates.Template{{ID: "three"}})
+	sdk.templateMu.Unlock()
+
+	stats := sdk.Stats()
+	assert.Equal(t, 2, stats.CachedTemplates)
+	assert.Equal(t, 2, stats.CachedSelections)
+	_, firstCached := sdk.templateSets["first"]
+	assert.False(t, firstCached)
+}
+
+func TestExecutionConcurrencyWaitHonorsContext(t *testing.T) {
+	baseOpts := testutils.DefaultOptions.Copy()
+	baseOpts.Silent = true
+	sdk, err := NewSDKWithRuntimeOptions(baseOpts, RuntimeOptions{
+		MaxConcurrentExecutions: 1,
+		MaxCachedTemplates:      1,
+	})
+	assert.Nil(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+
+	assert.Nil(t, sdk.acquireExecution(context.Background()))
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err = sdk.acquireExecution(ctx)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded))
+	assert.Equal(t, 1, sdk.Stats().ActiveExecutions)
+	sdk.releaseExecution()
+}
+
+func TestRequestTimeoutIsNotExecutionFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(1500 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	sdk := newRateLimitedSDKForTest(t, 0, 1)
+	t.Cleanup(func() { _ = sdk.Close() })
+	_, err := sdk.ExecuteNucleiWithResult(context.Background(), []string{server.URL}, SDKOptions(func(opts *types.Options) error {
+		opts.Templates = []string{filepath.Join("tests", "templates", "ratelimit-timing.yaml")}
+		opts.Timeout = 1
+		opts.Retries = 0
+		return nil
+	}))
+	assert.Nil(t, err)
 }
 
 // TestRateLimiterAndBulkSizeMatrix 验证 RateLimit 和 BulkSize 组合对请求到达节奏的影响。

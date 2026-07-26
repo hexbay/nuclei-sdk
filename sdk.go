@@ -44,15 +44,43 @@ type NucleiSDK struct {
 	// Result handling
 	Callback func(*output.ResultEvent) // Executed on results
 	// Lifecycle
-	mutex         sync.Mutex
-	tasks         sync.WaitGroup
-	closed        bool
-	safeOptions   *SafeOptions
-	runtime       *UnsafeOptions
-	store         *loader.Store
-	templateMu    sync.Mutex
-	templateSets  map[string][]*templates.Template
-	templateLoads int
+	mutex              sync.Mutex
+	tasks              sync.WaitGroup
+	closed             bool
+	safeOptions        *SafeOptions
+	runtime            *UnsafeOptions
+	store              *loader.Store
+	templateMu         sync.Mutex
+	templateSets       map[string]*templateSet
+	templateTick       uint64
+	cachedCount        int
+	maxCachedTemplates int
+	templateLoads      int
+	executionSlots     chan struct{}
+}
+
+type templateSet struct {
+	templates []*templates.Template
+	lastUsed  uint64
+}
+
+const (
+	defaultMaxConcurrentExecutions = 4
+	defaultMaxCachedTemplates      = 64
+)
+
+// RuntimeOptions bounds process-lifetime resources owned by an SDK.
+type RuntimeOptions struct {
+	MaxConcurrentExecutions int
+	MaxCachedTemplates      int
+}
+
+// RuntimeStats reports bounded runtime state without requiring heap profiling.
+type RuntimeStats struct {
+	ActiveExecutions int
+	CachedTemplates  int
+	CachedSelections int
+	TemplateLoads    int
 }
 
 // SafeOptions 包含公共参数，单例模式
@@ -101,8 +129,22 @@ var progressInitMutex sync.Mutex
 // NewSDK 返回一个新的 NucleiSDK 实例
 // 初始化所有必要的组件，包括日志级别、协议、工作池和目录
 func NewSDK(opts *types.Options) (*NucleiSDK, error) {
+	return NewSDKWithRuntimeOptions(opts, RuntimeOptions{
+		MaxConcurrentExecutions: defaultMaxConcurrentExecutions,
+		MaxCachedTemplates:      defaultMaxCachedTemplates,
+	})
+}
+
+// NewSDKWithRuntimeOptions creates an SDK with explicit process resource limits.
+func NewSDKWithRuntimeOptions(opts *types.Options, runtimeOpts RuntimeOptions) (*NucleiSDK, error) {
 	if opts == nil {
 		return nil, errors.New("nuclei SDK options cannot be nil")
+	}
+	if runtimeOpts.MaxConcurrentExecutions <= 0 {
+		runtimeOpts.MaxConcurrentExecutions = defaultMaxConcurrentExecutions
+	}
+	if runtimeOpts.MaxCachedTemplates < 0 {
+		return nil, errors.New("maximum cached templates cannot be negative")
 	}
 	opts = opts.Copy()
 
@@ -149,10 +191,12 @@ func NewSDK(opts *types.Options) (*NucleiSDK, error) {
 	}
 	// Create SDK instance
 	sdk := &NucleiSDK{
-		ctx:          ctx,
-		options:      opts,
-		safeOptions:  safeOptions,
-		templateSets: make(map[string][]*templates.Template),
+		ctx:                ctx,
+		options:            opts,
+		safeOptions:        safeOptions,
+		templateSets:       make(map[string]*templateSet),
+		executionSlots:     make(chan struct{}, runtimeOpts.MaxConcurrentExecutions),
+		maxCachedTemplates: runtimeOpts.MaxCachedTemplates,
 	}
 	runtime, err := createSharedObjects(ctx, safeOptions, opts)
 	if err != nil {
@@ -208,6 +252,31 @@ func (n *NucleiSDK) beginExecution() error {
 	return nil
 }
 
+func (n *NucleiSDK) acquireExecution(ctx context.Context) error {
+	select {
+	case n.executionSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (n *NucleiSDK) releaseExecution() {
+	<-n.executionSlots
+}
+
+// Stats returns a snapshot of SDK-owned execution and template resources.
+func (n *NucleiSDK) Stats() RuntimeStats {
+	n.templateMu.Lock()
+	defer n.templateMu.Unlock()
+	return RuntimeStats{
+		ActiveExecutions: len(n.executionSlots),
+		CachedTemplates:  n.cachedTemplateCount(),
+		CachedSelections: len(n.templateSets),
+		TemplateLoads:    n.templateLoads,
+	}
+}
+
 func (n *NucleiSDK) ExecuteNucleiWithResult(ctx context.Context, targets []string, opts ...SDKOptions) ([]*output.ResultEvent, error) {
 	collector := newResultCollector()
 	err := n.ExecuteNucleiWithOptsCtx(ctx, targets, collector.Write, opts...)
@@ -218,6 +287,10 @@ func (n *NucleiSDK) ExecuteNucleiWithOptsCtx(ctx context.Context, targets []stri
 		return err
 	}
 	defer n.tasks.Done()
+	if err := n.acquireExecution(ctx); err != nil {
+		return err
+	}
+	defer n.releaseExecution()
 
 	//	所有的初始化都需要在这里进行
 	baseOpts := n.options.Copy()
@@ -253,41 +326,80 @@ func (n *NucleiSDK) loadTemplates(opts *types.Options) ([]*templates.Template, e
 
 	n.templateMu.Lock()
 	defer n.templateMu.Unlock()
+	n.templateTick++
 	if len(paths) == 0 {
 		const allTemplates = "__all__"
 		if cached, ok := n.templateSets[allTemplates]; ok {
-			return cached, nil
+			cached.lastUsed = n.templateTick
+			return cached.templates, nil
 		}
-		if err := n.store.Load(); err != nil {
+		loaded, err := n.store.LoadTemplates([]string{config.DefaultConfig.TemplatesDirectory})
+		if err != nil {
 			return nil, errorutil.New("Could not load templates: %s\n", err)
 		}
-		loaded := n.store.Templates()
 		if len(loaded) == 0 {
 			return nil, errorutil.New("No templates available")
 		}
-		n.templateSets[allTemplates] = loaded
 		n.templateLoads++
+		n.cacheTemplateSet(allTemplates, loaded)
+		n.purgeParserCaches()
 		return loaded, nil
 	}
 
 	loaded := make([]*templates.Template, 0)
 	for _, path := range paths {
-		pathTemplates, ok := n.templateSets[path]
+		cached, ok := n.templateSets[path]
 		if !ok {
-			var err error
-			pathTemplates, err = n.store.LoadTemplates([]string{path})
+			pathTemplates, err := n.store.LoadTemplates([]string{path})
 			if err != nil {
 				return nil, errorutil.New("Could not load templates: %s\n", err)
 			}
-			n.templateSets[path] = pathTemplates
 			n.templateLoads++
+			n.cacheTemplateSet(path, pathTemplates)
+			n.purgeParserCaches()
+			loaded = append(loaded, pathTemplates...)
+			continue
 		}
-		loaded = append(loaded, pathTemplates...)
+		cached.lastUsed = n.templateTick
+		loaded = append(loaded, cached.templates...)
 	}
 	if len(loaded) == 0 {
 		return nil, errorutil.New("No templates available")
 	}
 	return loaded, nil
+}
+
+func (n *NucleiSDK) cacheTemplateSet(key string, loaded []*templates.Template) {
+	limit := n.maxCachedTemplates
+	if limit == 0 || len(loaded) > limit {
+		return
+	}
+	for n.cachedTemplateCount()+len(loaded) > limit {
+		var oldestKey string
+		var oldestTick uint64
+		for candidate, entry := range n.templateSets {
+			if oldestKey == "" || entry.lastUsed < oldestTick {
+				oldestKey = candidate
+				oldestTick = entry.lastUsed
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		n.cachedCount -= len(n.templateSets[oldestKey].templates)
+		delete(n.templateSets, oldestKey)
+	}
+	n.templateSets[key] = &templateSet{templates: loaded, lastUsed: n.templateTick}
+	n.cachedCount += len(loaded)
+}
+
+func (n *NucleiSDK) cachedTemplateCount() int {
+	return n.cachedCount
+}
+
+func (n *NucleiSDK) purgeParserCaches() {
+	n.safeOptions.parser.Cache().Purge()
+	n.safeOptions.parser.CompiledCache().Purge()
 }
 
 func executeTemplates(ctx context.Context, inputProvider *provider.SimpleInputProvider, loadedTemplates []*templates.Template, callback ResultCallback, opts *types.Options) error {
@@ -350,7 +462,11 @@ func executeTemplates(ctx context.Context, inputProvider *provider.SimpleInputPr
 				scanCtx := scan.NewScanContext(ctx, input)
 				scanCtx.OnResult = onResult
 				if _, err := template.Executer.ExecuteWithResults(scanCtx); err != nil {
-					recordError(err)
+					// Protocol/request timeouts are normal no-match outcomes. Only
+					// cancellation of the caller's execution context is task-fatal.
+					if ctx.Err() != nil {
+						recordError(ctx.Err())
+					}
 				}
 			}(target, template)
 		}
