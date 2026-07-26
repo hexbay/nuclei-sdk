@@ -66,7 +66,7 @@ type templateSet struct {
 
 const (
 	defaultMaxConcurrentExecutions = 4
-	defaultMaxCachedTemplates      = 64
+	defaultMaxCachedTemplates      = 1024
 )
 
 // RuntimeOptions bounds process-lifetime resources owned by an SDK.
